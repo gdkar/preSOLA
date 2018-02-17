@@ -39,13 +39,13 @@ __kernel void eval_state_1(
 
     const int l_sz  = get_local_size(0);
     const int me    = get_global_id(0);
-    const int sz    = get_global_size(0);
+    const int sgn   = get_global_id(1);
 
     const int l_me  = get_local_id(0);
-    const int g_sz  = get_num_groups(0);
-    const int g_me  = me / l_sz;
+    const int g_sz  = get_num_groups(0) * get_num_groups(1);
+    const int g_me  = (get_group_id(1) *  get_num_groups(0)) + get_group_id(0);
 
-    const int lag = lag_base + me * lag_step;
+    const int lag = (lag_base + me * lag_step) * (sgn ? -1 : 1);
 
     float ord0  = (float)(0);
     float2 ord2 = (float2)(0);
@@ -121,13 +121,13 @@ __kernel void eval_state_2(
     const float2 alpha = expa(2.0 / win_length);
     const int l_sz  = get_local_size(0);
     const int me    = get_global_id(0);
-    const int sz    = get_global_size(0);
+    const int sgn   = get_global_id(1);
 
     const int l_me  = get_local_id(0);
-    const int g_sz  = get_num_groups(0);
-    const int g_me  = me / l_sz;
+    const int g_sz  = get_num_groups(0) * get_num_groups(1);
+    const int g_me  = (get_group_id(1) *  get_num_groups(0)) + get_group_id(0);
 
-    const int lag = lag_base + me * lag_step;
+    const int lag = (lag_base + me * lag_step) * (sgn ? -1 : 1);
 
     float ord0  = (float)(0);
     float2 ord2 = (float2)(0);

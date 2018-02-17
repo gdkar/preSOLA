@@ -113,15 +113,13 @@ class PreContext:
         start   = np.int32(self._win_length // 2)
         res     = []
         ibuf = None
-        obuf0 = None
-        obuf1 = None
+        obuf = None
 
 
         ev0 = None
         ev1 = None
         ev_up = None
-        kernel0 = cl.Kernel(self._program,'eval_state_2' if k2 else 'eval_state_1')#self._program.eval_state_2 if k2 else self._program.eval_state_1
-        kernel1 = cl.Kernel(self._program,'eval_state_2' if k2 else 'eval_state_1')#self._program.eval_state_2 if k2 else self._program.eval_state_1
+        kernel = cl.Kernel(self._program,'eval_state_2' if k2 else 'eval_state_1')#self._program.eval_state_2 if k2 else self._program.eval_state_1
         while True:
             if used == first.shape[0]:
                 if it:
@@ -138,14 +136,13 @@ class PreContext:
                         it = None
                 else:
                     lst = []
-                    for p0,p1 in res:
-                        if p0[1]: [_.wait() for _ in p0[1]]
-                        if p1[1]: [_.wait() for _ in p1[1]]
+                    for b,e in res:
+                        if e: [_.wait() for _ in e]
 #                        p0[1].wait()
 #                        p1[1].wait()
-                        lst.append((p0[0],p1[0]))
+                        lst.append(b)
 
-                    return lst
+                    return np.concatenate(lst)
 
             if used < first.shape[0] and fill < buf.shape[0]:
                 chunk   = min(buf.shape[0] - fill, first.shape[0]-used)
@@ -174,20 +171,18 @@ class PreContext:
                     ev_up = [cl.enqueue_copy(self._queue, ibuf.base_data, buf.copy(), device_offset=ibuf.offset,is_blocking=False,wait_for=ibuf.events)]
 #                    ibuf.set(buf,async=True)
 #                if obuf0 is None or obuf0.shape != (block_size,self._lag_group_count):
-                obuf0 = cla.zeros(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
-                obuf1 = cla.zeros(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
+                obuf = cla.zeros(self._queue, (block_size,2, self._lag_group_count),dtype=splice_point)
 
-                lbuf0 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
-                lbuf1 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
+                lbuf = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
 
 #                if k2:
-                ev0 = kernel0(
+                ev0 = kernel(
                     self._queue
-                    , (self._lag_count,)
-                    , (self._lag_group_size,)
+                    , (self._lag_count,2)
+                    , (self._lag_group_size,1)
                     , ibuf.data
-                    , obuf0.data
-                    , lbuf0
+                    , obuf.data
+                    , lbuf
                     , offset
                     , np.int32(start)
                     , self._win_length
@@ -198,25 +193,9 @@ class PreContext:
                     , wait_for = ev_up
                     )
 
-                ev1 = kernel1(
-                    self._queue
-                    , (self._lag_count,)
-                    , (self._lag_group_size,)
-                    , ibuf.data
-                    , obuf1.data
-                    , lbuf1
-                    , offset
-                    , np.int32(start)
-                    , self._win_length
-                    , -self._lag_base
-                    , -self._lag_step
-                    , self._interval
-                    , np.int32(block_size)
-                    , wait_for = ev_up
-                    )
 #                o0 = np.empty(obuf0.shape,obuf0.dtype)
 #                o1 = np.empty(obuf1.shape,obuf1.dtype)
-                res.append(((obuf0.get(async=True),list(obuf0.events)),(obuf1.get(async=True),list(obuf1.events))))
+                res.append((obuf.get(async=True),list(obuf.events)))
 #                o0,cl.enqueue_copy(self._queue, o0, obuf0.base_data, device_offset=obuf0.offset,is_blocking=False,wait_for=list(ev0) if ev0 else None))
 #                           ,(o1,cl.enqueue_copy(self._queue, o1, obuf1.base_data, device_offset=obuf1.offset,is_blocking=False,wait_for=list(ev1) if ev1 else None))))
 
