@@ -54,25 +54,25 @@ class PreContext:
         kernels = pathlib.Path(__file__).resolve().with_name('kernels.cl')
         with kernels.open('r') as _f:
             self._program = cl.Program(self._context, _f.read())
-        self._program.build(options='-cl-finite-math-only',devices=self._context.devices)
+        self._program.build(options='-cl-unsafe-math-optimizations -cl-finite-math-only -cl-no-signed-zeros -cl-strict-aliasing -cl-mad-enable',devices=self._context.devices)
 
-        rate            = int(kwargs.pop('rate',44100))
-        win_len         = (int(kwargs.pop('win_len_s',0)) * rate) or int(kwargs.pop('win_len',(2048 * 3) // 2))
-        interval        = (int(kwargs.pop('interval_s',0)) * rate) or int(kwargs.pop('interval',512))
-        lag_base        = (int(kwargs.pop('lag_base_s',0)) * rate) or int(kwargs.pop('lag_base',384))
+        rate            = float(kwargs.pop('rate',44100))
+        win_len         = int(float(kwargs.pop('win_len_s',0)) * rate) or int(kwargs.pop('win_len',(2048 * 3) // 2))
+        interval        = int(float(kwargs.pop('interval_s',0)) * rate) or int(kwargs.pop('interval',512))
+        lag_base        = int(float(kwargs.pop('lag_base_s',0)) * rate) or int(kwargs.pop('lag_base',384))
         lag_group_size  =  int(kwargs.pop('lag_group_size', 256))
-        lag_precision   = (int(kwargs.pop('lag_precision_s',0)) * rate) or int(kwargs.pop('lag_precision',128))
-        lag_max         = (int(kwargs.pop('lag_max_s',0)) * rate) or int(kwargs.pop('lag_max',2432))
+        lag_precision   = int(float(kwargs.pop('lag_precision_s',0)) * rate) or int(kwargs.pop('lag_precision',128))
+        lag_max         = int(float(kwargs.pop('lag_max_s',0)) * rate) or int(kwargs.pop('lag_max',2432))
         block_size      =  int(kwargs.pop('block_size',1<<16))
 
-        lag_group_size  = min(64,(1 << ((lag_group_size-1).bit_length())))
+        lag_group_size  = min(self._queue.device.max_work_group_size,(1 << ((lag_group_size-1).bit_length())))
         lag_step        = lag_precision // lag_group_size
         lag_precision   = lag_group_size * lag_step
         lag_group_count = (lag_max - lag_base + lag_precision - 1) // lag_precision
         lag_count       = lag_group_size * lag_group_count
         lag_max         = lag_base + lag_group_count * lag_precision
 
-
+        self._rate              = rate
         self._win_length        = np.int32(win_len)
         self._interval          = np.int32(interval)
         self._lag_base          = np.int32(lag_base)
@@ -115,13 +115,13 @@ class PreContext:
         ibuf = None
         obuf0 = None
         obuf1 = None
-        lbuf0 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
-        lbuf1 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
 
 
         ev0 = None
         ev1 = None
         ev_up = None
+        kernel0 = cl.Kernel(self._program,'eval_state_2' if k2 else 'eval_state_1')#self._program.eval_state_2 if k2 else self._program.eval_state_1
+        kernel1 = cl.Kernel(self._program,'eval_state_2' if k2 else 'eval_state_1')#self._program.eval_state_2 if k2 else self._program.eval_state_1
         while True:
             if used == first.shape[0]:
                 if it:
@@ -161,10 +161,11 @@ class PreContext:
                 block_size = (fill - self._pad_pre - self._pad_post) // self._interval
                 block_shift= block_size * self._interval
 
+
             if fill == buf.shape[0]:
                 ev_up = None
                 if ibuf is None or ibuf.shape != buf.shape:
-                    ibuf = cla.to_device(self._queue,buf,async=True)
+                    ibuf = cla.to_device(self._queue,buf.copy(),async=True)
                     ev_up = ibuf.events
                 else:
 #                    if ev0: ev0.wait()
@@ -173,55 +174,47 @@ class PreContext:
                     ev_up = [cl.enqueue_copy(self._queue, ibuf.base_data, buf.copy(), device_offset=ibuf.offset,is_blocking=False,wait_for=ibuf.events)]
 #                    ibuf.set(buf,async=True)
 #                if obuf0 is None or obuf0.shape != (block_size,self._lag_group_count):
-                obuf0 = cla.empty(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
-#                elif obuf0.events:
-#                    if not ev_up:
-#                        ev_up = list(obuf0.events)
-#                    else:
-#                        ev_up.extend(obuf0.events)
-#                if obuf1 is None or obuf1.shape != (block_size,self._lag_group_count):
-                obuf1 = cla.empty(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
-#                elif obuf1.events:
-#                    if not ev_up:
-#                        ev_up = list(obuf1.events)
-#                    else:
-#                        ev_up.extend(obuf1.events)
+                obuf0 = cla.zeros(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
+                obuf1 = cla.zeros(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
 
-                if k2:
-                    ev0 = self._program.eval_state_2(
-                        self._queue
-                      , (self._lag_count,)
-                      , (self._lag_group_size,)
-                      , ibuf.data
-                      , obuf0.data
-                      , lbuf0
-                      , offset
-                      , np.int32(start)
-                      , self._win_length
-                      , self._lag_base
-                      , self._lag_step
-                      , self._interval
-                      , np.int32(block_shift)
-                      , wait_for = ev_up
-                        )
+                lbuf0 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
+                lbuf1 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
 
-                    ev1 = self._program.eval_state_2(
-                        self._queue
-                      , (self._lag_count,)
-                      , (self._lag_group_size,)
-                      , ibuf.data
-                      , obuf1.data
-                      , lbuf1
-                      , offset
-                      , np.int32(start)
-                      , self._win_length
-                      , -self._lag_base
-                      , -self._lag_step
-                      , self._interval
-                      , np.int32(block_shift)
-                      , wait_for = ev_up
-                        )
-                else:
+#                if k2:
+                ev0 = kernel0(
+                    self._queue
+                    , (self._lag_count,)
+                    , (self._lag_group_size,)
+                    , ibuf.data
+                    , obuf0.data
+                    , lbuf0
+                    , offset
+                    , np.int32(start)
+                    , self._win_length
+                    , self._lag_base
+                    , self._lag_step
+                    , self._interval
+                    , np.int32(block_shift)
+                    , wait_for = ev_up
+                    )
+
+                ev1 = kernel1(
+                    self._queue
+                    , (self._lag_count,)
+                    , (self._lag_group_size,)
+                    , ibuf.data
+                    , obuf1.data
+                    , lbuf1
+                    , offset
+                    , np.int32(start)
+                    , self._win_length
+                    , -self._lag_base
+                    , -self._lag_step
+                    , self._interval
+                    , np.int32(block_shift)
+                    , wait_for = ev_up
+                    )
+                if False:
                     ev0 = self._program.eval_state_1(
                         self._queue
                       , (self._lag_count,)

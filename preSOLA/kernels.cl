@@ -6,7 +6,7 @@ float2 tran(float2 a)
 {
     return a.yx;
 }
-float2 expa(float a)
+float2 expa(double a)
 {
     return (float2)(cospi(a),sinpi(a));
 }
@@ -51,7 +51,7 @@ __kernel void eval_state_1(
 
 
     __global const float * in_ref = in + offset + win_length;
-    __global const float * out_ref = in_ref;
+    __global const float * out_ref = in_ref - win_length;
     __global const float * in_dif = in_ref - lag;
     __global const float * out_dif = out_ref - lag;
     int i = -win_length;
@@ -132,7 +132,7 @@ __kernel void eval_state_2(
 
 
     __global const float2 * in_ref = in + offset + win_length;
-    __global const float2 * out_ref = in_ref;
+    __global const float2 * out_ref = in_ref - win_length;
     __global const float2 * in_dif = in_ref - lag;
     __global const float2 * out_dif = out_ref - lag;
     int i = -win_length;
@@ -156,13 +156,13 @@ __kernel void eval_state_2(
                 ord0 += d2;
                 ord2.x += d2;
             }
-            ord2 = cmul(alpha, ord2);
             {
                 const float2 d = out_ref[i] - out_dif[i];
                 const float d2 = dot(d,d);
                 ord0   -= d2;
                 ord2.x -= d2;
             }
+            ord2 = cmul(alpha, ord2);
             const float err = ord0 - ord2.x;
             if(err < pt.err) {
                 pt.err = err;
