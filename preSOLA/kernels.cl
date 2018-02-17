@@ -50,8 +50,8 @@ __kernel void eval_state_1(
     float2 ord2 = (float2)(0);
 
 
-    __global const float * in_ref = in + offset;
-    __global const float * out_ref = in_ref - win_length;
+    __global const float * in_ref = in + offset + win_length;
+    __global const float * out_ref = in_ref;
     __global const float * in_dif = in_ref - lag;
     __global const float * out_dif = out_ref - lag;
     int i = -win_length;
@@ -131,8 +131,8 @@ __kernel void eval_state_2(
     float2 ord2 = (float2)(0);
 
 
-    __global const float2 * in_ref = in + offset;
-    __global const float2 * out_ref = in_ref - win_length;
+    __global const float2 * in_ref = in + offset + win_length;
+    __global const float2 * out_ref = in_ref;
     __global const float2 * in_dif = in_ref - lag;
     __global const float2 * out_dif = out_ref - lag;
     int i = -win_length;

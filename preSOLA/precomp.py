@@ -60,7 +60,7 @@ class PreContext:
         win_len         = (int(kwargs.pop('win_len_s',0)) * rate) or int(kwargs.pop('win_len',(2048 * 3) // 2))
         interval        = (int(kwargs.pop('interval_s',0)) * rate) or int(kwargs.pop('interval',512))
         lag_base        = (int(kwargs.pop('lag_base_s',0)) * rate) or int(kwargs.pop('lag_base',384))
-        lag_group_size  =  int(kwargs.pop('lag_group_size', 64))
+        lag_group_size  =  int(kwargs.pop('lag_group_size', 256))
         lag_precision   = (int(kwargs.pop('lag_precision_s',0)) * rate) or int(kwargs.pop('lag_precision',128))
         lag_max         = (int(kwargs.pop('lag_max_s',0)) * rate) or int(kwargs.pop('lag_max',2432))
         block_size      =  int(kwargs.pop('block_size',1<<16))
@@ -112,7 +112,16 @@ class PreContext:
         offset  = np.int32(self._pad_pre)
         start   = np.int32(self._win_length // 2)
         res     = []
+        ibuf = None
+        obuf0 = None
+        obuf1 = None
+        lbuf0 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
+        lbuf1 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
 
+
+        ev0 = None
+        ev1 = None
+        ev_up = None
         while True:
             if used == first.shape[0]:
                 if it:
@@ -128,7 +137,15 @@ class PreContext:
                         print('first:',first)
                         it = None
                 else:
-                    return res
+                    lst = []
+                    for p0,p1 in res:
+                        if p0[1]: [_.wait() for _ in p0[1]]
+                        if p1[1]: [_.wait() for _ in p1[1]]
+#                        p0[1].wait()
+#                        p1[1].wait()
+                        lst.append((p0[0],p1[0]))
+
+                    return lst
 
             if used < first.shape[0] and fill < buf.shape[0]:
                 chunk   = min(buf.shape[0] - fill, first.shape[0]-used)
@@ -145,12 +162,30 @@ class PreContext:
                 block_shift= block_size * self._interval
 
             if fill == buf.shape[0]:
-                ibuf = cla.to_device(self._queue,buf)
+                ev_up = None
+                if ibuf is None or ibuf.shape != buf.shape:
+                    ibuf = cla.to_device(self._queue,buf,async=True)
+                    ev_up = ibuf.events
+                else:
+#                    if ev0: ev0.wait()
+#                    if ev1: ev1.wait()
+#                    evts = []
+                    ev_up = [cl.enqueue_copy(self._queue, ibuf.base_data, buf.copy(), device_offset=ibuf.offset,is_blocking=False,wait_for=ibuf.events)]
+#                    ibuf.set(buf,async=True)
+#                if obuf0 is None or obuf0.shape != (block_size,self._lag_group_count):
                 obuf0 = cla.empty(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
+#                elif obuf0.events:
+#                    if not ev_up:
+#                        ev_up = list(obuf0.events)
+#                    else:
+#                        ev_up.extend(obuf0.events)
+#                if obuf1 is None or obuf1.shape != (block_size,self._lag_group_count):
                 obuf1 = cla.empty(self._queue, (block_size,self._lag_group_count),dtype=splice_point)
-
-                lbuf0 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
-                lbuf1 = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
+#                elif obuf1.events:
+#                    if not ev_up:
+#                        ev_up = list(obuf1.events)
+#                    else:
+#                        ev_up.extend(obuf1.events)
 
                 if k2:
                     ev0 = self._program.eval_state_2(
@@ -167,7 +202,7 @@ class PreContext:
                       , self._lag_step
                       , self._interval
                       , np.int32(block_shift)
-                      , wait_for = None
+                      , wait_for = ev_up
                         )
 
                     ev1 = self._program.eval_state_2(
@@ -184,7 +219,7 @@ class PreContext:
                       , -self._lag_step
                       , self._interval
                       , np.int32(block_shift)
-                      , wait_for = None
+                      , wait_for = ev_up
                         )
                 else:
                     ev0 = self._program.eval_state_1(
@@ -201,7 +236,7 @@ class PreContext:
                       , self._lag_step
                       , self._interval
                       , np.int32(block_shift)
-                      , wait_for = None
+                      , wait_for = ev_up
                         )
 
                     ev1 = self._program.eval_state_1(
@@ -218,61 +253,20 @@ class PreContext:
                       , np.int32(-self._lag_step)
                       , self._interval
                       , np.int32(block_shift)
-                      , wait_for = None
+                      , wait_for = ev_up
                         )
-                ev0.wait()
-                ev1.wait()
-                o0 = obuf0.get()
-                o1 = obuf1.get()
-                res.append((o0,o1))
+#                o0 = np.empty(obuf0.shape,obuf0.dtype)
+#                o1 = np.empty(obuf1.shape,obuf1.dtype)
+                res.append(((obuf0.get(async=True),list(obuf0.events)),(obuf1.get(async=True),list(obuf1.events))))
+#                o0,cl.enqueue_copy(self._queue, o0, obuf0.base_data, device_offset=obuf0.offset,is_blocking=False,wait_for=list(ev0) if ev0 else None))
+#                           ,(o1,cl.enqueue_copy(self._queue, o1, obuf1.base_data, device_offset=obuf1.offset,is_blocking=False,wait_for=list(ev1) if ev1 else None))))
+
+#                if ev_up:
+#                    ev_up[0].wait()
                 keep = fill - block_shift
                 buf[:keep] = buf[fill - keep:fill]
                 fill  -= block_shift
                 start += block_shift
-
-#        return res
-#        ibuf = cla.to_device(self._queue,ibuf)
-#
-#        sz = ibuf.shape[0]
-#
-#        obuf = cla.empty(self._queue, ( (count + self._interval-1)//self._interval,self._lag_group_count), dtype=splice_point)
-#        lbuf = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
-#
-#        if k2:
-#            ev = self._program.eval_state_2(
-#                self._queue
-#              , ( self._lag_count,)
-#              , (self._lag_group_size,)
-#              , ibuf.data
-#              , obuf.data
-#              , lbuf
-#              , np.int32(offset)
-#              , np.int32(start)
-#              , self._win_length
-#              , self._lag_base
-#              , self._lag_step
-#              , self._interval
-#              , np.int32(count)
-#              , wait_for=None)
-#        else:
-#            ev = self._program.eval_state_1(
-#                self._queue
-#              , ( self._lag_count,)
-#              , (self._lag_group_size,)
-#              , ibuf.data
-#              , obuf.data
-#              , lbuf
-#              , np.int32(offset)
-#              , np.int32(start)
-#              , self._win_length
-#              , self._lag_base
-#              , self._lag_step
-#              , self._interval
-#              , np.int32(count)
-#              , wait_for=None)
-#
-#        ev.wait()
-#        return obuf.get()
 
 class Searcher:
     def __init__(self, sample_rate = 44100, block = None, err_step = 64, err_max = 1024, time_splice = 512, time_step = 1024, origin_n = 0, alpha = 1.0):
