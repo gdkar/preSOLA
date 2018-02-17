@@ -103,8 +103,8 @@ class PreContext:
         block_size = self._block_size
         block_shift= self._block_shift
 
-        if k2:  shape = (self._buf_size, 2)
-        else:   shape = (self._buf_size,)
+        if k2:  shape = (self._buf_size + first.shape[0] * 2, 2)
+        else:   shape = (self._buf_size + first.shape[0] * 2,  )
 
         buf     = np.zeros(shape, dtype=np.float32)
         fill    = self._pad_pre
@@ -162,7 +162,7 @@ class PreContext:
                 block_shift= block_size * self._interval
 
 
-            if fill == buf.shape[0]:
+            if fill >= min(buf.shape[0],self._buf_size):
                 ev_up = None
                 if ibuf is None or ibuf.shape != buf.shape:
                     ibuf = cla.to_device(self._queue,buf.copy(),async=True)
@@ -194,7 +194,7 @@ class PreContext:
                     , self._lag_base
                     , self._lag_step
                     , self._interval
-                    , np.int32(block_shift)
+                    , np.int32(block_size)
                     , wait_for = ev_up
                     )
 
@@ -211,43 +211,9 @@ class PreContext:
                     , -self._lag_base
                     , -self._lag_step
                     , self._interval
-                    , np.int32(block_shift)
+                    , np.int32(block_size)
                     , wait_for = ev_up
                     )
-                if False:
-                    ev0 = self._program.eval_state_1(
-                        self._queue
-                      , (self._lag_count,)
-                      , (self._lag_group_size,)
-                      , ibuf.data
-                      , obuf0.data
-                      , lbuf0
-                      , offset
-                      , np.int32(start)
-                      , self._win_length
-                      , self._lag_base
-                      , self._lag_step
-                      , self._interval
-                      , np.int32(block_shift)
-                      , wait_for = ev_up
-                        )
-
-                    ev1 = self._program.eval_state_1(
-                        self._queue
-                      , (self._lag_count,)
-                      , (self._lag_group_size,)
-                      , ibuf.data
-                      , obuf1.data
-                      , lbuf1
-                      , offset
-                      , np.int32(start)
-                      , self._win_length
-                      , np.int32(-self._lag_base)
-                      , np.int32(-self._lag_step)
-                      , self._interval
-                      , np.int32(block_shift)
-                      , wait_for = ev_up
-                        )
 #                o0 = np.empty(obuf0.shape,obuf0.dtype)
 #                o1 = np.empty(obuf1.shape,obuf1.dtype)
                 res.append(((obuf0.get(async=True),list(obuf0.events)),(obuf1.get(async=True),list(obuf1.events))))
@@ -258,7 +224,8 @@ class PreContext:
 #                    ev_up[0].wait()
                 keep = fill - block_shift
                 buf[:keep] = buf[fill - keep:fill]
-                fill  -= block_shift
+                buf[keep:] = 0
+                fill = keep
                 start += block_shift
 
 class Searcher:

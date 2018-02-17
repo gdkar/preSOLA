@@ -34,6 +34,7 @@ __kernel void eval_state_1(
   , int count
     )
 {
+    count *= interval;
     const float2 alpha = expa(2.0 / win_length);
 
     const int l_sz  = get_local_size(0);
@@ -116,6 +117,7 @@ __kernel void eval_state_2(
   , int count
     )
 {
+    count *= interval;
     const float2 alpha = expa(2.0 / win_length);
     const int l_sz  = get_local_size(0);
     const int me    = get_global_id(0);
