@@ -19,22 +19,41 @@ shift_point = np.dtype({
   , align = True)
 
 class Block:
-    def __init__(self, data=None, lag_base = 384, lag_step = 2 * 64, nlags = 16, pos_base = 0, pos_step = 512):
-        if data is None:
-            data = np.zeros(shape=(nlags,1,),dtype=splice_point)
-        self.data     = data
-        self.nlags    = data.shape[1]
-        self.lag_base = lag_base
-        self.lag_step = lag_step
-        self.pos_base = pos_base
-        self.pos_step = pos_step
+    def __init__(self, data, **kwargs):
+        self.data = data
+        rate            = float(kwargs.pop('rate',44100))
+        win_length      = int(kwargs.pop('win_length',(2048 * 3) // 2))
+        time_base       = int(kwargs.pop('time_base',win_length // 2))
+        time_precision  = int(kwargs.pop('time_precision',512))
+        lag_base        = int(kwargs.pop('lag_base',384))
+        lag_precision   = int(kwargs.pop('lag_precision',128))
 
-    def ix_guess(self, pos, lag, back = True):
-        ix_lag = (lag - self.lag_base) // self.lag_step
-        if not back:
-            pos -= (lag + self.lag_step - 1)
-        ix_pos = (pos - self.pos_base) // self.pos_step
-        return (ix_pos, ix_lag)
+        self._rate = rate
+        self._win_length = win_length
+        self._time_precision = time_precision
+        self._time_base      = time_base
+        self._time_max       = time_base + self.data.shape[0] * time_precision
+        self._lag_base = lag_base
+        self._lag_precision = lag_precision
+        self._lag_group_count = self.data.shape[2]
+        self._lag_max         = lag_base + self._lag_group_count * self._lag_precision
+        self._neg_base        = 1 - self._lag_max
+        self._neg_max         = 1 - self._lag_base
+
+        self._time_precision_inv = self._time_precision ** -1
+        self._lag_precision_inv = self._lag_precision ** -1
+
+    def _time_lower_bound(self, when):
+        return max(int((when - self._time_base) * self._time_precision_inv),0)
+
+    def _time_upper_bound(self, when):
+        return min(int(((when - self._time_base) * self._time_precision_inv)+1),self.data.shape[0])
+
+    def _lag_abs_lower_bound(self, lag):
+        return max(int((abs(lag) - self._lag_base) * self._lag_precision_inv),0)
+
+    def _lag_abs_upper_bound(self, lag):
+        return min(int(((abs(lag) - self._lag_base) * self._lag_precision_inv)+1),self.data.shape[2])
 
 class PreContext:
     _kernel_src = str()
@@ -141,8 +160,14 @@ class PreContext:
 #                        p0[1].wait()
 #                        p1[1].wait()
                         lst.append(b)
-
-                    return np.concatenate(lst)
+                    return Block(
+                        data=np.concatenate(lst)
+                      , rate=self._rate
+                      , win_length=self._win_length
+                      , time_base = self._win_length // 2
+                      , time_precision = self._interval
+                      , lag_base=self._lag_base
+                      , lag_precision=self._lag_precision)
 
             if used < first.shape[0] and fill < buf.shape[0]:
                 chunk   = min(buf.shape[0] - fill, first.shape[0]-used)
@@ -208,39 +233,165 @@ class PreContext:
                 start += block_shift
 
 class Searcher:
-    def __init__(self, sample_rate = 44100, block = None, err_step = 64, err_max = 1024, time_splice = 512, time_step = 1024, origin_n = 0, alpha = 1.0):
+    def __init__(self, block, **kwargs):
         self.block       = block
-        self.sample_rate = sample_rate
-        self.err_step    = err_step
-        self.err_max     = err_max
-        self.err_bins    = (2 * err_max) // err_step
-        self.err_base    = err_max // err_step
-        self.time_splice = time_splice
-        self.time_step   = time_step
-        self.alpha       = alpha
-        self.origin_n    = origin_n
-        self.origin_o    = self.alpha * self.origin_n
-        self.time_o      = 0
+        self._rate       = block._rate
+        rate             = self._rate
+        err_max         = int(float(kwargs.pop('err_max_s',0)) * rate) or int(kwargs.pop('err_max',768))
+        err_precision   = int(float(kwargs.pop('err_precision_s',0))*rate) or int(kwargs.pop('err_precision', 64 ))
+        lap_length      = int(float(kwargs.pop('lap_length_s',0)) * rate) or int(kwargs.pop('lap_length',1024))
+        dp_step         = int(float(kwargs.pop('dp_step_s',0)) * rate) or int(kwargs.pop('dp_step',lap_length * 2))
+        lookahead       = int(float(kwargs.pop('lookahead_s',0)) * rate / dp_step) or int(kwargs.pop('lookahead',6))
+        solve_count     = int(kwargs.pop('solve_count',lookahead // 2))
 
-        self.table    = np.zeros(shape=(32,self.err_bins),dtype=shift_point)
+        alpha           = float(kwargs.pop('alpha',1.0))
+        delta_n         = float(kwargs.pop('delta_n',-self.block._lag_max - self.block._win_length//2))
+
+        self._err_max           = err_max
+        self._err_precision     = err_precision
+        self._lap_length        = lap_length
+        self._dp_step           = dp_step
+        self._lookahead_count   = lookahead
+        self._lookahead_distance= lookahead * dp_step
+        self._solve_count       = solve_count
+        self._solve_distance    = solve_count * dp_step
+
+        self._err_precision_inv = self._err_precision ** -1
+        self._err_bins_center   = np.ceil(self._err_max * self._err_precision_inv - 0.5) + 0.5
+        self._err_bins_count    = self._err_bin(self._err_max) + 1
+
+        self._t_o               = 0
+        self._alpha             = alpha
+        self._delta_n           = delta_n
+        self._delta_i           = int(self._t_o - self._t_n())
+
+        self._last_splice   = (self._t_o - self._lap_length // 2, self._delta_i)
+        self._splices       = col.deque()
+        self._solved_until  = self._t_o
+
+        self.table    = np.zeros(shape=(self._lookahead_count + 1,self._err_bins_count),dtype=shift_point)
         self.tidx     = 0
 
-    def _err_index(self, err):
-        return int((err + self.err_max) / self.err_step)
+    def _err_bin(self, err):
+        _bin = int(err * self._err_precision_inv + self._err_bins_center)
+        return None if (_bin < 0 or _bin >= self._err_bins_count) else _bin
 
-    def _error(self, time_o, origin_o):
-        return (1-self.alpha) * time_o - origin_o + self.alpha * self.origin_n
+    def _t_n(self, t_o=None):
+        if t_o is None: t_o = self._t_o
+        return self._alpha * ( t_o - self._delta_n)
 
-    def _fill_table(self, time_o, src, dst):
-        time_o_next = time_o + self.time_step
-        dst[::].err = np.inf
-        for back,sol in enumerate(src):
-            if sol.err == np.inf:
+    def _t_i(self, t_o=None):
+        if t_o is None: t_o = self._t_o
+        return t_o - self._delta_i
+
+    def _advance_t_o(self, count):
+        ret = []
+        while count > 0:
+            if self._splices:
+                splice = self._splices[0]
+                next_splice = splice[0] - self._lap_length // 2
+                if next_splice < self._solved_until:
+                    if next_splice < self._t_o + count:
+                        self._last_splice = splice
+                        self._delta_i = splice[1]
+                        ret.append(splice)
+                        self._splices.popleft()
+                        adv = next_splice - self._t_o
+                        self._t_o += adv
+                        count     -= adv
+                        continue
+
+            if self._solved_until < self._t_o + count:
+                adv = self._solved_until - self._t_o
+                self._t_o += adv
+                count     -= adv
+                self._do_solve()
                 continue
-            e = self._error(time_o_next, sol.off)
-            if abs(e) < self.err_max:
-                ei = self._err_index(e)
-                if dst[ei].err > sol.err:
-                    dst[ei] = sol
-                    dst[ei].back = back
-            l_min = e
+
+            self._t_o += count
+            return ret
+
+    def _error_at(self, t_o = None, delta_i = None):
+        if delta_i is None:
+            delta_i = self._delta_i
+        if t_o is None:
+            t_o = self._t_o
+        return (self._alpha - 1) * t_o - self._alpha * self._delta_n + delta_i
+
+    def _clear_table(self):
+        self.tidx = 0
+        self.table[::,::]['back'] = -1
+        self.table[::,::]['err' ] = np.float32(np.inf)
+
+    def _cur_tab_row(self):
+        return self.table[self.tidx,::]
+
+    def _next_tab_row(self):
+        return self.table[self.tidx,::]
+
+    def _do_solve(self):
+        self._splices.clear()
+        t_end = self._t_o + self._lookahead_distance
+        if abs(self._error_at(self._t_o)) < self._err_max and abs(self._error_at(t_end)) < self._err_max:
+            self._solved_until = self._t_o + self._solve_distance
+            return
+        t_l = max(self._t_o + self._lap_length // 2, self._last_splice[0] + self._lap_length)
+        t_h = t_l + self._dp_step
+        self._clear_table()
+        err_l = self._error_at(t_o = t_l)
+        bin_l = self._err_bin(err_l)
+
+        if not bin_l:
+            self._fill_next_relaxed(
+        if bin_l:
+            tab_row = self._cur_tab_row()
+            tab_row[bin_l]['err'] = 0
+            tab_row[bin_l]['pos'] = self._last_splice[0]
+            tab_row[bin_l]['off'] = self._last_splice[1]
+            self._fill_next(back=bin_l, t_h = t_h)
+        else:
+            tab_row = self._cur_tab_row()
+            bin_l = 0
+            tab_row[bin_l]['err'] = 0
+            tab_row[bin_l]['pos'] = self._last_splice[0]
+            tab_row[bin_l]['off'] = self._last_splice[1]
+            if not self._fill_next_relaxed(back=bin_l, t_h = t_h):
+                self._fix_jump()
+
+        t_stop = t_h
+        self.tidx += 1
+        while self.tidx < self._lookahead_count:
+            t_stop += self._dp_stop
+            tab_row = self._cur_tab_row()
+            have_next = False
+            for bin_l,bin_v in enumerate(tab_row):
+                if bin_v['err'] < np.inf:
+                    have_next = True
+                    self._fill_next(back=bin_l, t_h = t_stop)
+
+            if not have_next:
+
+                self.tidx -= 1
+
+        if self.tidx == self._lookahead_count:
+            bin_end = min(enumerate(self._cur_tab_row()),key=lambda x:x[1]['err'])
+            splices = [(bin_end[1]['pos'],bin_end[1]['off'])]
+            back = bin_end[1]['back']
+            for row in self.table[-2::-1]:
+                splices.append((row[back]['pos'],row[back]['off']))
+                back = row[back]['back']
+            last_splice = self._last_splice
+            for splice in splices[::-1]:
+                if splice != last_splice:
+                    self._splices.append(splice)
+                    last_splice = splice
+            self._solved_until = self._t_o + self._solve_distance
+            return
+        self.tidx = 0
+        try:
+            self._relaxed_dp_solve(pos = t_l, off = self._delta_i)
+            return
+        except ValueError:
+            pass
+        self._fix_jump()
+
