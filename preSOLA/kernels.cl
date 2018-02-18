@@ -1,3 +1,4 @@
+
 float2 conj(float2 a)
 {
     return (float2)(a.x,-a.y);
@@ -14,17 +15,16 @@ float2 cmul(float2 a, float2 b)
 {
     return (float2)( a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
-
 struct splice_point {
-    int      pos;
-    int      lag;
-    float    err;
+    int     pos;
+    int     lag;
+    float   err;
 } __attribute__((aligned(16)));
 
 __kernel void eval_state_1(
     __global const float * in
   , __global struct splice_point* out
-  , __local  struct splice_point *points
+  , __local  struct splice_point* points
   , int offset
   , int start_time
   , int win_length
@@ -107,7 +107,7 @@ __kernel void eval_state_1(
 __kernel void eval_state_2(
     __global const float2 * in
   , __global struct splice_point* out
-  , __local  struct splice_point *points
+  , __local  struct splice_point*points
   , int offset
   , int start_time
   , int win_length

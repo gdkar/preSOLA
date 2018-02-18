@@ -13,14 +13,13 @@ splice_point = np.dtype({
   , align=True)
 
 shift_point = np.dtype({
-    'names':['pos','off','back','err','e_max','e_min']
-  , 'formats':[np.int64,np.int64,np.int32,np.float32,np.float32,np.float32]
-    }
-  , align = True)
+    'names':['pos','off','err','back']
+  , 'formats':[np.int64,np.int64,np.float32,np.object]
+    })
 
 class Block:
     def __init__(self, data, **kwargs):
-        self.data = data
+        self.data       = data
         rate            = float(kwargs.pop('rate',44100))
         win_length      = int(kwargs.pop('win_length',(2048 * 3) // 2))
         time_base       = int(kwargs.pop('time_base',win_length // 2))
@@ -55,6 +54,26 @@ class Block:
     def _lag_abs_upper_bound(self, lag):
         return min(int(((abs(lag) - self._lag_base) * self._lag_precision_inv)+1),self.data.shape[2])
 
+    def _iter_rect(self, trng, lrng):
+        btrng = self._time_lower_bound(trng[0]),self._time_upper_bound(trng[1])
+        if lrng[0] * lrng[1] < 0:
+            raise ValueError('lag bounds must be either both non negative or both non positive',lrng)
+        if lrng[0] < 0:
+            blrng = self._lag_abs_lower_bound(lrng[1]),self._lag_abs_upper_bound(lrng[0])
+            rect  = self.data[btrng[0]:btrng[1],1,blrng[0]:blrng[1]].flat
+        else:
+            blrng = self._lag_abs_lower_bound(lrng[0]),self._lag_abs_upper_bound(lrng[1])
+            rect  = self.data[btrng[0]:btrng[1],0,blrng[0]:blrng[1]].flat
+        t0,t1 = trng
+        l0,l1 = lrng
+        if l1 < l0:
+            l0,l1=l1,l0
+        def trim(val):
+            pos,lag = val['pos'],val['lag']
+            return (t0<= pos and pos <= t1 and l0 <= lag and lag <= l1)
+
+        return filter(trim,rect)
+
 class PreContext:
     _kernel_src = str()
 
@@ -70,10 +89,11 @@ class PreContext:
             queue_obj   = cl.CommandQueue(context_obj)
         self._context = context_obj
         self._queue   = queue_obj
+        self._mem_pool = cl.tools.MemoryPool(cl.tools.ImmediateAllocator(self._queue))
         kernels = pathlib.Path(__file__).resolve().with_name('kernels.cl')
         with kernels.open('r') as _f:
             self._program = cl.Program(self._context, _f.read())
-        self._program.build(options='-cl-unsafe-math-optimizations -cl-finite-math-only -cl-no-signed-zeros -cl-strict-aliasing -cl-mad-enable',devices=self._context.devices)
+        self._program.build(options='-cl-no-signed-zeros -cl-strict-aliasing -cl-mad-enable',devices=self._context.devices)
 
         rate            = float(kwargs.pop('rate',44100))
         win_len         = int(float(kwargs.pop('win_len_s',0)) * rate) or int(kwargs.pop('win_len',(2048 * 3) // 2))
@@ -133,6 +153,7 @@ class PreContext:
         res     = []
         ibuf = None
         obuf = None
+        lbuf = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
 
 
         ev0 = None
@@ -154,14 +175,17 @@ class PreContext:
                         print('first:',first)
                         it = None
                 else:
-                    lst = []
-                    for b,e in res:
-                        if e: [_.wait() for _ in e]
-#                        p0[1].wait()
-#                        p1[1].wait()
-                        lst.append(b)
+                    if obuf is not None:
+                        evts = list(obuf.events)
+                        if evts:
+                            cl.wait_for_events(evts)
+                    del kernel
+                    del obuf
+                    del ibuf
+                    del lbuf
+
                     return Block(
-                        data=np.concatenate(lst)
+                        data=np.concatenate(res)
                       , rate=self._rate
                       , win_length=self._win_length
                       , time_base = self._win_length // 2
@@ -187,20 +211,22 @@ class PreContext:
             if fill >= min(buf.shape[0],self._buf_size):
                 ev_up = None
                 if ibuf is None or ibuf.shape != buf.shape:
-                    ibuf = cla.to_device(self._queue,buf.copy(),async=True)
-                    ev_up = ibuf.events
+                    ibuf = cla.to_device(self._queue,buf,async=True,allocator=self._mem_pool)
+                    ev_up = list(ibuf.events)
                 else:
-#                    if ev0: ev0.wait()
-#                    if ev1: ev1.wait()
-#                    evts = []
-                    ev_up = [cl.enqueue_copy(self._queue, ibuf.base_data, buf.copy(), device_offset=ibuf.offset,is_blocking=False,wait_for=ibuf.events)]
-#                    ibuf.set(buf,async=True)
-#                if obuf0 is None or obuf0.shape != (block_size,self._lag_group_count):
-                obuf = cla.zeros(self._queue, (block_size,2, self._lag_group_count),dtype=splice_point)
+#                    ev_up = [cl.enqueue_copy(self._queue, ibuf.base_data, buf., device_offset=ibuf.offset,is_blocking=True,wait_for=ibuf.events)]
+                    ibuf.set(buf,async=True)
+                    ev_up = list(ibuf.events)
 
-                lbuf = cl.LocalMemory(self._lag_group_size * splice_point.itemsize)
+                if not ev_up:
+                    ev_up = None
 
-#                if k2:
+                if obuf is None or obuf.shape != (block_size,2, self._lag_group_count):
+                    obuf = cla.zeros(self._queue, (block_size,2, self._lag_group_count),dtype=splice_point,allocator=self._mem_pool)
+                else:
+                    if obuf.events:
+                        cl.wait_for_events(obuf.events)
+
                 ev0 = kernel(
                     self._queue
                     , (self._lag_count,2)
@@ -218,15 +244,11 @@ class PreContext:
                     , wait_for = ev_up
                     )
 
-#                o0 = np.empty(obuf0.shape,obuf0.dtype)
-#                o1 = np.empty(obuf1.shape,obuf1.dtype)
-                res.append((obuf.get(async=True),list(obuf.events)))
-#                o0,cl.enqueue_copy(self._queue, o0, obuf0.base_data, device_offset=obuf0.offset,is_blocking=False,wait_for=list(ev0) if ev0 else None))
-#                           ,(o1,cl.enqueue_copy(self._queue, o1, obuf1.base_data, device_offset=obuf1.offset,is_blocking=False,wait_for=list(ev1) if ev1 else None))))
-
-#                if ev_up:
-#                    ev_up[0].wait()
+                ev0.wait()
+                res.append(obuf.get(async=True))
                 keep = fill - block_shift
+                if ev_up is not None:
+                    cl.wait_for_events(ev_up)
                 buf[:keep] = buf[fill - keep:fill]
                 buf[keep:] = 0
                 fill = keep
@@ -258,19 +280,20 @@ class Searcher:
 
         self._err_precision_inv = self._err_precision ** -1
         self._err_bins_center   = np.ceil(self._err_max * self._err_precision_inv - 0.5) + 0.5
-        self._err_bins_count    = self._err_bin(self._err_max) + 1
+        self._err_bins_count    = int(self._err_max * self._err_precision_inv + self._err_bins_center)
 
         self._t_o               = 0
         self._alpha             = alpha
         self._delta_n           = delta_n
         self._delta_i           = int(self._t_o - self._t_n())
 
-        self._last_splice   = (self._t_o - self._lap_length // 2, self._delta_i)
+        self._last_splice   = (self._t_o - self._lap_length // 2, self._delta_i, 0)
         self._splices       = col.deque()
         self._solved_until  = self._t_o
 
-        self.table    = np.zeros(shape=(self._lookahead_count + 1,self._err_bins_count),dtype=shift_point)
+        self.table    = np.zeros(shape=(self._lookahead_count + 1,self._err_bins_count),dtype=np.object)
         self.tidx     = 0
+        self._clear_table()
 
     def _err_bin(self, err):
         _bin = int(err * self._err_precision_inv + self._err_bins_center)
@@ -320,8 +343,10 @@ class Searcher:
 
     def _clear_table(self):
         self.tidx = 0
-        self.table[::,::]['back'] = -1
-        self.table[::,::]['err' ] = np.float32(np.inf)
+        z = np.zeros(shape=(1,),dtype=shift_point)[0]
+        z['err'] = np.inf
+        z['back'] = None
+        self.table.ravel()[::] = [z.copy() for _ in range(np.prod(self.table.shape))]
 
     def _cur_tab_row(self):
         return self.table[self.tidx,::]
@@ -330,68 +355,207 @@ class Searcher:
         return self.table[self.tidx,::]
 
     def _do_solve(self):
-        self._splices.clear()
-        t_end = self._t_o + self._lookahead_distance
-        if abs(self._error_at(self._t_o)) < self._err_max and abs(self._error_at(t_end)) < self._err_max:
-            self._solved_until = self._t_o + self._solve_distance
-            return
-        t_l = max(self._t_o + self._lap_length // 2, self._last_splice[0] + self._lap_length)
-        t_h = t_l + self._dp_step
         self._clear_table()
-        err_l = self._error_at(t_o = t_l)
-        bin_l = self._err_bin(err_l)
+        self.table[0,0]['err'] = 0
+        self.table[0,0]['pos'] = self._last_splice[0]
+        self.table[0,0]['off'] = self._last_splice[1]
+        t_l = max(self._last_splice[0] + self._lap_length, self._t_o + self._lap_length // 2)
+        t_h = t_l + self._dp_step
 
-        if not bin_l:
-            self._fill_next_relaxed(
-        if bin_l:
-            tab_row = self._cur_tab_row()
-            tab_row[bin_l]['err'] = 0
-            tab_row[bin_l]['pos'] = self._last_splice[0]
-            tab_row[bin_l]['off'] = self._last_splice[1]
-            self._fill_next(back=bin_l, t_h = t_h)
+        self._dp_populate(self.table[0,0],self.table[1],t_h)
+        have_vals = False
+        for idx in range(1,self.table.shape[0]-1):
+            t_h += self._dp_step
+            have_vals = False
+            for val in self.table[idx]:
+                if val['back'] is not None:
+                    have_vals = True
+                    self._dp_populate(val, self.table[idx+1],t_h)
+            if not have_vals:
+                break
+        if not have_vals:
+            self._clear_table()
+            self.table[0,0]['err'] = 0
+            self.table[0,0]['pos'] = self._last_splice[0]
+            self.table[0,0]['off'] = self._last_splice[1]
+            t_l = max(self._last_splice[0] + self._lap_length, self._t_o + self._lap_length // 2)
+            t_h = t_l + self._dp_step
+
+            self._relaxed_populate(self.table[0,0],self.table[1],t_h)
+            for idx in range(1,self.table.shape[0]-1):
+                t_h += self._dp_step
+                have_vals = False
+                for val in self.table[idx]:
+                    if val['back'] is not None:
+                        have_vals = True
+                        self._dp_populate(val, self.table[idx+1],t_h)
+                if not have_vals:
+                    return
+        e = min(self.table[-1],key=lambda x:x['err'])
+        self._splices.clear()
+        splices = col.deque()
+        while e:
+            splices.appendleft((e['pos'],e['off'],e['err']))
+            e = e['back']
+
+        splice = self._last_splice
+        for s in splices:
+            if s[1] != splice[1]:
+                splice = (s[0],s[1],s[2]-splice[2])
+                self._splices.append(splice)
+        self._solved_until = self._t_o + self._solve_distance
+
+    @property
+    def alpha(self):
+        return self._alpha
+
+    @alpha.setter
+    def alpha(self,val):
+        if val != self._alpha:
+            self._alpha = val
+            self._solved_until = self._t_o
+
+    @property
+    def delta_n(self):
+        return self._delta_n
+
+    @delta_n.setter
+    def delta_n(self,val):
+        if val != self._delta_n:
+            self._delta_n = val
+            self._solved_until = self._t_o
+
+
+    def _dp_populate(self, back, row, t_h = None):
+        if not back:
+            return
+        t_l = max(back['pos'] + self._lap_length, self._t_o + self._lap_length // 2)
+        if t_h is None:
+            t_h = t_l + self._dp_step
+
+        d_i = back['off']
+        _E_pre = self._E_pre(t_l,t_h,d_i)
+        _E_end = self._E_end(t_l,t_h,d_i)
+
+        aim1 = self._alpha - 1
+
+        if aim1 < 0:
+            _E_end = (max(_E_end[0],0),max(_E_end[1],0))
         else:
-            tab_row = self._cur_tab_row()
-            bin_l = 0
-            tab_row[bin_l]['err'] = 0
-            tab_row[bin_l]['pos'] = self._last_splice[0]
-            tab_row[bin_l]['off'] = self._last_splice[1]
-            if not self._fill_next_relaxed(back=bin_l, t_h = t_h):
-                self._fix_jump()
+            _E_end = (min(_E_end[0],0),min(_E_end[1],0))
 
-        t_stop = t_h
-        self.tidx += 1
-        while self.tidx < self._lookahead_count:
-            t_stop += self._dp_stop
-            tab_row = self._cur_tab_row()
-            have_next = False
-            for bin_l,bin_v in enumerate(tab_row):
-                if bin_v['err'] < np.inf:
-                    have_next = True
-                    self._fill_next(back=bin_l, t_h = t_stop)
+        _E_end_base = aim1 * t_h - self._alpha * self._delta_n + d_i
+        def _E_end_actual(val):
+            return _E_end_base + val['lag']
 
-            if not have_next:
+        e = _E_end_base
+        e_bin = self._err_bin(e)
+        _back_err = back['err']
+        if e_bin:
+            prev = row[e_bin]
+            _err = _back_err
+            if not prev['back'] or prev['err'] > _err:
+                prev['back'] = back
+                prev['pos']  = d_i
+                prev['err']  = _err
+                prev['off']  = d_i
 
-                self.tidx -= 1
+        l0 = self._alpha * (self._delta_n - d_i) - self._err_max
+        l1 = self._alpha * (self._delta_n - d_i) + self._err_max
 
-        if self.tidx == self._lookahead_count:
-            bin_end = min(enumerate(self._cur_tab_row()),key=lambda x:x[1]['err'])
-            splices = [(bin_end[1]['pos'],bin_end[1]['off'])]
-            back = bin_end[1]['back']
-            for row in self.table[-2::-1]:
-                splices.append((row[back]['pos'],row[back]['off']))
-                back = row[back]['back']
-            last_splice = self._last_splice
-            for splice in splices[::-1]:
-                if splice != last_splice:
-                    self._splices.append(splice)
-                    last_splice = splice
-            self._solved_until = self._t_o + self._solve_distance
-            return
-        self.tidx = 0
-        try:
-            self._relaxed_dp_solve(pos = t_l, off = self._delta_i)
-            return
-        except ValueError:
-            pass
-        self._fix_jump()
+        def _E_post(val):
+            t_s = val['pos']
+            d_s = val['lag']
+            mid = aim1 * t_s + d_s
+            return l0 <= mid and mid <= l1
 
+        _rect = filter(_E_post,self.block._iter_rect(_E_pre,_E_end))
+
+        for val in _rect:
+            e = _E_end_actual(val)
+            e_bin = self._err_bin(e)
+            if e_bin:
+                prev = row[e_bin]
+                _err = val['err'] + _back_err
+                if prev['back'] is None or prev['err'] > _err:
+                    prev['back'] = back
+                    prev['pos']  = d_i + val['pos']
+                    prev['err']  = _err
+                    prev['off']  = d_i + val['lag']
+
+    def _relaxed_populate(self, back, row, t_h = None):
+        print('relaxed_populate',back)
+        t_l = max(back['pos'] + self._lap_length, self._t_o + self._lap_length // 2)
+        if t_h is None:
+            t_h = t_l + self._dp_step
+
+        d_i = back['off']
+        _E_pre = self._E_bound(t_l,t_h,d_i)
+        _E_end = self._E_end(t_l,t_h,d_i)
+
+        aim1 = self._alpha - 1
+
+        _E_end_base = aim1 * t_h - self._alpha * self._delta_n + d_i
+        def _E_end_actual(val):
+            return _E_end_base + val['lag']
+
+        e = _E_end_base
+        e_bin = self._err_bin(e)
+        _back_err = back['err']
+        if e_bin:
+            prev = row[e_bin]
+            _err = _back_err
+            if not prev['back'] or prev['err'] > _err:
+                row[e_bin]['back'] = back
+                row[e_bin]['pos']  = d_i
+                row[e_bin]['err']  = _err
+                row[e_bin]['off']  = d_i
+
+        l0 = self._alpha * (self._delta_n - d_i) - self._err_max
+        l1 = self._alpha * (self._delta_n - d_i) + self._err_max
+
+        def _E_post(val):
+            t_s = val['pos']
+            d_s = val['lag']
+            mid = aim1 * t_s + d_s
+            return l0 <= mid and mid <= l1
+
+        _rect = filter(_E_post,self.block._iter_rect(_E_pre,_E_end))
+
+        for val in _rect:
+            e = _E_end_actual(val)
+            e_bin = self._err_bin(e)
+            if e_bin:
+                prev = row[e_bin]
+                _err = val['err'] + _back_err
+                if not prev['back'] or prev['err'] > _err:
+                    row[e_bin]['back'] = back
+                    row[e_bin]['pos']  = d_i + val['pos']
+                    row[e_bin]['err']  = _err
+                    row[e_bin]['off']  = d_i + val['lag']
+
+    def _E_bound(self, t_l, t_h, d_i):
+        return (t_l - d_i, t_h - d_i)
+
+    def _E_pre(self, t_l, t_h, d_i):
+        _lo = t_l - d_i
+        _hi = t_h - d_i
+
+        if self._alpha != 1.0:
+            v0 = self._alpha * ( self._delta_n - d_i) - self._err_max
+            v1 = self._alpha * ( self._delta_n - d_i) + self._err_max
+            ai = (self._alpha - 1.0)**-1
+            v0 *= ai
+            v1 *= ai
+            if ai < 0:
+                v0,v1=v1,v0
+            _lo = max(_lo,v0)
+            _hi = min(_hi,v1)
+
+        return (_lo,_hi)
+
+    def _E_end(self, t_l, t_h, d_i):
+        a  = self._alpha
+        ai = 1.0 - a
+        v = ai * t_h + a * self._delta_n - d_i
+        return (v - self._err_max, v + self._err_max)
